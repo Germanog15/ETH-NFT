@@ -1,0 +1,112 @@
+WITH nft_marketplaces_info AS (
+    SELECT project
+    , name
+    FROM nft.marketplaces_info
+    )
+
+, all_trades AS (
+    SELECT block_time
+    , block_number
+    , CASE WHEN LENGTH(aggregator_name) > 1 THEN aggregator_name ELSE project END AS project
+    , amount_usd
+    , amount_eth
+    , buyer
+    , seller
+    , is_wash_trade
+    FROM (
+        SELECT t.block_time
+        , t.block_number
+        , COALESCE(names.name, t.project) AS project
+        , COALESCE(names_agg.name, t.aggregator_name) AS aggregator_name
+        , t.amount_usd
+        , t.amount_usd/pu.price AS amount_eth
+        , t.buyer
+        , t.seller
+        , COALESCE(wt.is_wash_trade, FALSE) AS is_wash_trade
+        FROM nft.trades t
+        LEFT JOIN nft.wash_trades wt ON wt.block_number=t.block_number
+            AND wt.unique_trade_id=t.unique_trade_id
+        LEFT JOIN nft_marketplaces_info names ON names.project=t.project -- https://dune.com/queries/1933124 For proper project name capitalisations
+        LEFT JOIN nft_marketplaces_info names_agg ON names_agg.project=t.aggregator_name -- https://dune.com/queries/1933124 For proper project name capitalisations
+        LEFT JOIN prices.usd pu ON pu.blockchain IS NULL
+            AND pu.symbol = 'ETH'
+            AND pu.minute = date_trunc('minute', t.block_time)
+            AND pu.minute >= date_trunc('week', NOW() - interval '2' year)
+            AND pu.minute < date_trunc('day', NOW())
+        WHERE t.blockchain = 'ethereum'
+        AND t.block_time >= date_trunc('week', NOW() - interval '2' year)
+        AND t.block_time < date_trunc('day', NOW())
+        AND t.tx_hash NOT IN (SELECT tx_hash FROM query_1982559) -- https://dune.com/queries/1982559 (Remove ocasional bad data)
+        )
+    )
+
+, wash_filtered_trades AS (
+    SELECT *
+    FROM all_trades
+    WHERE is_wash_trade IN (false, NULL)
+    )
+
+, volume_and_trades AS (
+    SELECT date_trunc('day', t.block_time) AS time
+    , project
+    , true AS wash_filter
+    , SUM(t.amount_usd) AS volume_usd
+    , SUM(t.amount_eth) AS volume_eth
+    , COUNT(*) AS trades
+    FROM wash_filtered_trades t
+    GROUP BY 1, 2, 3
+    
+    UNION ALL
+    
+    SELECT date_trunc('day', t.block_time) AS time
+    , project
+    , false AS wash_filter
+    , SUM(t.amount_usd) AS volume_usd
+    , SUM(t.amount_eth) AS volume_eth
+    , COUNT(*) AS trades
+    FROM all_trades t
+    GROUP BY 1, 2, 3
+    )
+
+, traders AS (
+    SELECT DISTINCT date_trunc('day', t.block_time) AS time
+    , t.project
+    , true AS wash_filter
+    , COUNT(DISTINCT trader) AS traders
+    FROM wash_filtered_trades t
+    CROSS JOIN UNNEST(ARRAY[t.buyer, t.seller]) AS t(trader)
+    GROUP BY 1, 2
+    
+    UNION ALL
+    
+    SELECT DISTINCT date_trunc('day', t.block_time) AS time
+    , t.project
+    , false AS wash_filter
+    , COUNT(DISTINCT trader) AS traders
+    FROM all_trades t
+    CROSS JOIN UNNEST(ARRAY[t.buyer, t.seller]) AS t(trader)
+    GROUP BY 1, 2
+    )
+
+, ordering AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY SUM(volume_usd) DESC) AS ranking
+    , project
+    , SUM(volume_usd) AS volume_usd
+    FROM volume_and_trades
+    WHERE time >= (SELECT MAX(time) - interval '3' month FROM volume_and_trades)
+    AND wash_filter = true
+    GROUP BY 2
+    )
+    
+SELECT vt.time
+, CASE WHEN vt.project = 'Gem' AND vt.time >= date('2023-04-04') THEN 'OpenSea Pro' ELSE vt.project END AS project
+, vt.wash_filter
+, vt.volume_usd
+, vt.volume_eth
+, CAST(vt.trades AS double) AS trades
+, CAST(t.traders AS double) AS traders
+, o.ranking AS latest_ranking
+FROM volume_and_trades vt
+LEFT JOIN traders t ON t.time=vt.time AND t.project=vt.project AND t.wash_filter=vt.wash_filter
+LEFT JOIN nft_marketplaces_info names ON names.project=vt.project -- https://dune.com/queries/1933124 For proper project name capitalisations
+LEFT JOIN ordering o ON o.project=vt.project
